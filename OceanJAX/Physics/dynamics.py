@@ -35,9 +35,9 @@ Linear equation of state:
 Contents
 --------
   equation_of_state         – linear EOS -> rho (Nx,Ny,Nz)
-  hydrostatic_pressure      – cumulative g-rho integration -> p_c (Nx,Ny,Nz)
-  pressure_gradient_u       – barotropic + baroclinic PGF at u-points
-  pressure_gradient_v       – barotropic + baroclinic PGF at v-points
+  hydrostatic_pressure      – cumulative g-rho' integration -> p_hyd_prime (Nx,Ny,Nz)
+  pressure_gradient_u       – barotropic (-g∂eta/∂x) + baroclinic PGF at u-points
+  pressure_gradient_v       – barotropic (-g∂eta/∂y) + baroclinic PGF at v-points
   coriolis_u                – +f*v tendency at u-points
   coriolis_v                – -f*u tendency at v-points
   momentum_tendency_u       – full explicit RHS for u
@@ -96,33 +96,47 @@ def hydrostatic_pressure(
     params,
 ) -> jnp.ndarray:
     """
-    Baroclinic hydrostatic pressure at cell centres by downward integration.
+    Baroclinic hydrostatic pressure from the density **anomaly** at cell centres.
 
-    The pressure at the w-face above cell k is:
-      p_w[k+1] = p_w[k] + rho[k] * g * dz_c[k],   p_w[0] = 0
+    In the Boussinesq framework the momentum equations only require the
+    pressure contribution from the density anomaly rho' = rho - rho0.
+    The barotropic (background) part rho0*g*z is absorbed into the
+    reference state and the free-surface term -g*∂eta/∂x(y).  Integrating
+    the full density rho would introduce a large rho0*g*z background that
+    generates spurious pressure-gradient errors near stepped topography and
+    mask transitions; using rho' eliminates this artefact.
 
-    The cell-centre value is the arithmetic mean of the bounding faces:
-      p_c[k]   = p_w[k] + 0.5 * rho[k] * g * dz_c[k]
+    Integration (downward from the surface):
 
-    The scan iterates from the surface (k=0) downward; dry cells are
-    zeroed by mask_c before integration so that the pressure below a
-    seamount is not contaminated by the wet-cell values above it.
+      p_w[0]   = 0
+      p_w[k+1] = p_w[k]  +  rho'[k] * g * dz_c[k]
+
+    Cell-centre value (arithmetic mean of bounding w-faces):
+
+      p_hyd_prime[k] = p_w[k]  +  0.5 * rho'[k] * g * dz_c[k]
+
+    Dry cells are zeroed by mask_c before integration.
 
     Args:
-        rho    : (Nx, Ny, Nz) [kg m-3]
+        rho    : (Nx, Ny, Nz) total density [kg m-3], e.g. from equation_of_state
         grid   : OceanGrid
-        params : ModelParams  (uses g)
+        params : ModelParams  (uses g, rho0)
 
     Returns:
-        p_c : (Nx, Ny, Nz) [Pa], zeroed at dry cells
+        p_hyd_prime : (Nx, Ny, Nz) [Pa]
+                      Baroclinic hydrostatic pressure from density anomaly only.
+                      Zeroed at dry cells.
     """
-    # Pressure increment for each layer; zero dry cells
-    dp = rho * grid.mask_c * params.g * grid.dz_c   # (Nx, Ny, Nz)
+    # Density anomaly; zero dry cells before integrating
+    rho_prime = (rho - params.rho0) * grid.mask_c            # (Nx, Ny, Nz)
+
+    # Pressure increment per layer: rho' * g * dz
+    dp = rho_prime * params.g * grid.dz_c                    # (Nx, Ny, Nz)
 
     def _step(p_top, dp_k):
         """
         p_top : pressure at the top w-face of the current layer, (Nx, Ny)
-        dp_k  : rho*g*dz for the current layer, (Nx, Ny)
+        dp_k  : rho'*g*dz for the current layer, (Nx, Ny)
         Returns cell-centre pressure and the pressure at the bottom face.
         """
         p_center = p_top + 0.5 * dp_k
@@ -132,8 +146,8 @@ def hydrostatic_pressure(
     # Transpose to (Nz, Nx, Ny) for lax.scan to iterate over k
     dp_T = jnp.moveaxis(dp, -1, 0)                          # (Nz, Nx, Ny)
     _, p_c_T = jax.lax.scan(_step, jnp.zeros((grid.Nx, grid.Ny)), dp_T)
-    p_c = jnp.moveaxis(p_c_T, 0, -1)                        # (Nx, Ny, Nz)
-    return p_c * grid.mask_c
+    p_hyd_prime = jnp.moveaxis(p_c_T, 0, -1)               # (Nx, Ny, Nz)
+    return p_hyd_prime * grid.mask_c
 
 
 # ---------------------------------------------------------------------------
@@ -141,49 +155,55 @@ def hydrostatic_pressure(
 # ---------------------------------------------------------------------------
 
 def pressure_gradient_u(
-    p_hyd: jnp.ndarray,
-    eta:   jnp.ndarray,
-    grid:  OceanGrid,
+    p_hyd_prime: jnp.ndarray,
+    eta:         jnp.ndarray,
+    grid:        OceanGrid,
     params,
 ) -> jnp.ndarray:
     """
     Zonal pressure gradient force at u-points [m s-2].
 
-      PGF_u = -g * grad_x(eta) - (1/rho0) * grad_x(p_hyd)
+      PGF_u = -g * grad_x(eta)  -  (1/rho0) * grad_x(p_hyd_prime)
+               ↑ barotropic           ↑ baroclinic (density anomaly only)
 
-    The barotropic term (g*grad_x(eta)) is 2D and broadcast over all depths.
-    Both gradients are computed by the existing grad_x operator (zeroed at
-    dry u-faces via mask_u).
+    p_hyd_prime must be the output of hydrostatic_pressure(), which
+    integrates only the density anomaly rho' = rho - rho0.  Passing the
+    full hydrostatic pressure would reintroduce the background rho0*g*z
+    term and create spurious pressure-gradient errors near topography.
+
+    Both gradients use the existing grad_x operator (zeroed at dry u-faces
+    via mask_u).  The barotropic term is 2-D and broadcast over all depths.
 
     Args:
-        p_hyd  : (Nx, Ny, Nz) baroclinic hydrostatic pressure [Pa]
-        eta    : (Nx, Ny)     sea-surface height [m]
-        grid   : OceanGrid
-        params : ModelParams  (uses g, rho0)
+        p_hyd_prime : (Nx, Ny, Nz) baroclinic hydrostatic pressure [Pa]
+                      (density-anomaly integral from hydrostatic_pressure)
+        eta         : (Nx, Ny) sea-surface height [m]
+        grid        : OceanGrid
+        params      : ModelParams  (uses g, rho0)
 
     Returns:
         (Nx, Ny, Nz) [m s-2], zeroed at dry u-faces
     """
-    pg_bt = params.g * grad_x(eta, grid)                    # (Nx, Ny)
-    pg_bc = grad_x(p_hyd, grid) / params.rho0               # (Nx, Ny, Nz)
+    pg_bt = params.g * grad_x(eta, grid)                         # (Nx, Ny)
+    pg_bc = grad_x(p_hyd_prime, grid) / params.rho0              # (Nx, Ny, Nz)
     return -(pg_bt[:, :, jnp.newaxis] + pg_bc) * grid.mask_u
 
 
 def pressure_gradient_v(
-    p_hyd: jnp.ndarray,
-    eta:   jnp.ndarray,
-    grid:  OceanGrid,
+    p_hyd_prime: jnp.ndarray,
+    eta:         jnp.ndarray,
+    grid:        OceanGrid,
     params,
 ) -> jnp.ndarray:
     """
     Meridional pressure gradient force at v-points [m s-2].
 
-      PGF_v = -g * grad_y(eta) - (1/rho0) * grad_y(p_hyd)
+      PGF_v = -g * grad_y(eta)  -  (1/rho0) * grad_y(p_hyd_prime)
 
     Args / Returns: same convention as pressure_gradient_u.
     """
-    pg_bt = params.g * grad_y(eta, grid)                    # (Nx, Ny)
-    pg_bc = grad_y(p_hyd, grid) / params.rho0               # (Nx, Ny, Nz)
+    pg_bt = params.g * grad_y(eta, grid)                         # (Nx, Ny)
+    pg_bc = grad_y(p_hyd_prime, grid) / params.rho0              # (Nx, Ny, Nz)
     return -(pg_bt[:, :, jnp.newaxis] + pg_bc) * grid.mask_v
 
 
@@ -217,18 +237,26 @@ def coriolis_u(
     Returns:
         (Nx, Ny, Nz) [m s-2], zeroed at dry u-faces
     """
+    # Explicitly mask v at dry v-faces before interpolation so that land
+    # points contribute zero to the average rather than stale values.
+    # (A normalised average dividing by the wet-neighbour count would avoid
+    # diluting the Coriolis force near boundaries, but changes the discrete
+    # interpolation amplitude near coastlines and should be considered
+    # alongside the full momentum boundary-condition treatment.)
+    v_m = v * grid.mask_v                                   # (Nx, Ny, Nz)
+
     # v[i+1, j, k] — eastern neighbor (periodic in x)
-    v_e = jnp.roll(v, -1, axis=0)
+    v_e = jnp.roll(v_m, -1, axis=0)
 
     # v[i, j-1, k] and v[i+1, j-1, k] — southern v-faces; zero at j=0 (wall)
     v_s   = jnp.concatenate(
-        [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=v.dtype), v[:, :-1, :]], axis=1
+        [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=v.dtype), v_m[:, :-1, :]], axis=1
     )
     v_e_s = jnp.concatenate(
         [jnp.zeros((grid.Nx, 1, grid.Nz), dtype=v.dtype), v_e[:, :-1, :]], axis=1
     )
 
-    v_at_u = 0.25 * (v + v_s + v_e + v_e_s)   # (Nx, Ny, Nz)
+    v_at_u = 0.25 * (v_m + v_s + v_e + v_e_s)              # (Nx, Ny, Nz)
 
     # f_c is zonally invariant; broadcast from (Nx, Ny) to (Nx, Ny, Nz)
     return grid.f_c[:, :, jnp.newaxis] * v_at_u * grid.mask_u
@@ -258,15 +286,18 @@ def coriolis_v(
     Returns:
         (Nx, Ny, Nz) [m s-2], zeroed at dry v-faces
     """
+    # Explicitly mask u at dry u-faces before interpolation (see coriolis_u).
+    u_m = u * grid.mask_u                                   # (Nx, Ny, Nz)
+
     # u[i-1, j, k] — western neighbor (periodic in x)
-    u_w = jnp.roll(u, 1, axis=0)
+    u_w = jnp.roll(u_m, 1, axis=0)
 
     # u[i, j+1, k] and u[i-1, j+1, k] — northern u-faces; zero at j=Ny-1
-    u_n   = jnp.roll(u, -1, axis=1)
+    u_n   = jnp.roll(u_m, -1, axis=1)
     u_n   = u_n.at[:, -1, :].set(0.0)
     u_w_n = jnp.roll(u_n, 1, axis=0)
 
-    u_at_v = 0.25 * (u + u_w + u_n + u_w_n)   # (Nx, Ny, Nz)
+    u_at_v = 0.25 * (u_m + u_w + u_n + u_w_n)              # (Nx, Ny, Nz)
 
     # f at v-point: average in j; north Neumann (copy last value)
     f_n = jnp.roll(grid.f_c, -1, axis=1)
@@ -282,7 +313,8 @@ def coriolis_v(
 
 def momentum_tendency_u(
     state,
-    grid:   OceanGrid,
+    p_hyd_prime: jnp.ndarray,
+    grid:        OceanGrid,
     params,
 ) -> jnp.ndarray:
     """
@@ -290,33 +322,35 @@ def momentum_tendency_u(
 
       du/dt|_explicit = Coriolis + PGF + horizontal viscosity
 
-    Nonlinear momentum advection (u·∇u) is excluded; it requires a
-    separate energy-consistent discretisation on the staggered u-cell
-    geometry and can be added as ``momentum_advection_u`` without
-    changing this interface.
+    p_hyd_prime (the density-anomaly hydrostatic pressure) must be
+    computed once by the caller via::
 
-    Vertical viscosity is treated implicitly by the time stepper
-    (OceanJAX.Physics.mixing.implicit_vertical_visc); do not add it here
-    to avoid double-counting.
+        rho         = equation_of_state(state.T, state.S, params)
+        p_hyd_prime = hydrostatic_pressure(rho, grid, params)
 
-    Surface wind stress forcing should be added by the time stepper
-    separately, analogous to tracer surface forcing.
+    and passed to both momentum_tendency_u and momentum_tendency_v to
+    avoid repeating the expensive lax.scan integration.
+
+    Exclusions (add via the time stepper, not here):
+      - Nonlinear momentum advection (u·∇u): requires geometry-consistent
+        discretisation on staggered u-cell volumes.
+      - Vertical viscosity: treated implicitly by mixing.implicit_vertical_visc.
+      - Surface wind stress: added separately, analogous to tracer surface forcing.
 
     Args:
-        state  : OceanState  (uses u, v, T, S, eta)
-        grid   : OceanGrid
-        params : ModelParams
+        state       : OceanState  (uses u, v, eta)
+        p_hyd_prime : (Nx, Ny, Nz) baroclinic hydrostatic pressure [Pa]
+                      from hydrostatic_pressure()
+        grid        : OceanGrid
+        params      : ModelParams  (uses nu_h, rho0, g)
 
     Returns:
         du/dt|_explicit : (Nx, Ny, Nz) [m s-2]
     """
     from OceanJAX.Physics.mixing import horizontal_viscosity   # deferred
 
-    rho   = equation_of_state(state.T, state.S, params)
-    p_hyd = hydrostatic_pressure(rho, grid, params)
-
-    cor  = coriolis_u(state.v, grid)
-    pgf  = pressure_gradient_u(p_hyd, state.eta, grid, params)
+    cor    = coriolis_u(state.v, grid)
+    pgf    = pressure_gradient_u(p_hyd_prime, state.eta, grid, params)
     visc_u, _ = horizontal_viscosity(state.u, state.v, params.nu_h, grid)
 
     return (cor + pgf + visc_u) * grid.mask_u
@@ -324,7 +358,8 @@ def momentum_tendency_u(
 
 def momentum_tendency_v(
     state,
-    grid:   OceanGrid,
+    p_hyd_prime: jnp.ndarray,
+    grid:        OceanGrid,
     params,
 ) -> jnp.ndarray:
     """
@@ -332,23 +367,23 @@ def momentum_tendency_v(
 
       dv/dt|_explicit = Coriolis + PGF + horizontal viscosity
 
-    Same exclusions as ``momentum_tendency_u``.
+    Same calling convention and exclusions as ``momentum_tendency_u``.
+    p_hyd_prime should be the same array passed to momentum_tendency_u
+    (computed once per time step by the caller).
 
     Args:
-        state  : OceanState  (uses u, v, T, S, eta)
-        grid   : OceanGrid
-        params : ModelParams
+        state       : OceanState  (uses u, v, eta)
+        p_hyd_prime : (Nx, Ny, Nz) baroclinic hydrostatic pressure [Pa]
+        grid        : OceanGrid
+        params      : ModelParams  (uses nu_h, rho0, g)
 
     Returns:
         dv/dt|_explicit : (Nx, Ny, Nz) [m s-2]
     """
     from OceanJAX.Physics.mixing import horizontal_viscosity   # deferred
 
-    rho   = equation_of_state(state.T, state.S, params)
-    p_hyd = hydrostatic_pressure(rho, grid, params)
-
-    cor  = coriolis_v(state.u, grid)
-    pgf  = pressure_gradient_v(p_hyd, state.eta, grid, params)
+    cor    = coriolis_v(state.u, grid)
+    pgf    = pressure_gradient_v(p_hyd_prime, state.eta, grid, params)
     _, visc_v = horizontal_viscosity(state.u, state.v, params.nu_h, grid)
 
     return (cor + pgf + visc_v) * grid.mask_v
