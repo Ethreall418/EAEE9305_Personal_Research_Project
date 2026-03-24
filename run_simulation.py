@@ -1,6 +1,6 @@
 """
-run_simulation.py
-=================
+run_simulation.py  v2
+=====================
 Entry-point script for OceanJAX idealised simulations.
 
 Usage
@@ -12,13 +12,21 @@ The script:
   2. Initialises a resting ocean state (uniform T, S; zero velocity).
   3. Applies optional constant surface forcing.
   4. Integrates forward using chunked jax.lax.scan calls.
-  5. Writes T, S, eta snapshots to a NetCDF file at a configurable save interval.
+  5. Writes T, S, eta snapshots to a NetCDF file whenever the step counter
+     crosses a save-interval boundary (independent of chunk_size).
   6. Prints per-chunk diagnostics (step, time, T/S/eta range, NaN flag, wall-clock).
+
+Chunking vs. saving
+-------------------
+``chunk_size`` controls how many steps are compiled into one ``jax.lax.scan``
+trace.  ``save_interval`` controls how often output is written.  Neither needs
+to be a multiple of the other.  A partial final chunk runs correctly when
+``n_steps`` is not a multiple of ``chunk_size``.
 
 Output layout
 -------------
-NetCDF variables follow the internal array order: (time, x, y, z) for 3-D fields
-and (time, x, y) for eta.  No transposition is performed.
+NetCDF variables follow the internal array order: (time, x, y, z) for 3-D
+fields and (time, x, y) for eta.  No transposition is performed.
 """
 
 from __future__ import annotations
@@ -83,7 +91,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     r.add_argument("--chunk_size",    type=int, default=10,
                    help="Steps per JIT-compiled scan call")
     r.add_argument("--save_interval", type=int, default=10,
-                   help="Steps between NetCDF writes; must be a multiple of chunk_size")
+                   help="Steps between NetCDF writes (independent of chunk_size)")
 
     # Output
     p.add_argument("--output", type=str, default="output.nc",
@@ -94,16 +102,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
 
 def _validate_args(args: argparse.Namespace) -> None:
     errors = []
-    if args.save_interval % args.chunk_size != 0:
-        errors.append(
-            f"save_interval ({args.save_interval}) must be a multiple of "
-            f"chunk_size ({args.chunk_size})"
-        )
-    if args.n_steps % args.chunk_size != 0:
-        errors.append(
-            f"n_steps ({args.n_steps}) must be a multiple of "
-            f"chunk_size ({args.chunk_size})"
-        )
+    if args.chunk_size < 1:
+        errors.append("chunk_size must be >= 1")
+    if args.n_steps < 1:
+        errors.append("n_steps must be >= 1")
+    if args.save_interval < 1:
+        errors.append("save_interval must be >= 1")
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)
@@ -111,10 +115,27 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Forcing helper
+# ---------------------------------------------------------------------------
+
+def _make_forcing(n: int, args: argparse.Namespace, grid: OceanGrid) -> SurfaceForcing | None:
+    """Build a constant SurfaceForcing with a leading time axis of length n."""
+    if not any([args.heat_flux, args.fw_flux, args.tau_x, args.tau_y]):
+        return None
+    ones = jnp.ones((n, grid.Nx, grid.Ny), dtype=jnp.float32)
+    return SurfaceForcing(
+        heat_flux=ones * args.heat_flux,
+        fw_flux=ones   * args.fw_flux,
+        tau_x=ones     * args.tau_x,
+        tau_y=ones     * args.tau_y,
+    )
+
+
+# ---------------------------------------------------------------------------
 # NetCDF helpers
 # ---------------------------------------------------------------------------
 
-def _create_output_file(path: str, grid: OceanGrid) -> nc.Dataset:
+def _create_output_file(path: str, grid: OceanGrid, args: argparse.Namespace) -> nc.Dataset:
     """
     Create and initialise the NetCDF output file.
 
@@ -124,8 +145,23 @@ def _create_output_file(path: str, grid: OceanGrid) -> nc.Dataset:
     No transposition is needed when writing.
     """
     ds = nc.Dataset(path, mode="w", format="NETCDF4")
-    ds.description = "OceanJAX idealised simulation output"
-    ds.Conventions = "CF-1.8"
+
+    # Global attributes
+    ds.description   = "OceanJAX idealised simulation output"
+    ds.Conventions   = "CF-1.8"
+    ds.history       = " ".join(sys.argv)
+    ds.dt            = args.dt
+    ds.nx            = args.nx
+    ds.ny            = args.ny
+    ds.nz            = args.nz
+    ds.lon_min       = args.lon_min
+    ds.lon_max       = args.lon_max
+    ds.lat_min       = args.lat_min
+    ds.lat_max       = args.lat_max
+    ds.depth_max     = args.depth_max
+    ds.n_steps       = args.n_steps
+    ds.chunk_size    = args.chunk_size
+    ds.save_interval = args.save_interval
 
     # Dimensions
     ds.createDimension("time", None)   # unlimited
@@ -176,10 +212,10 @@ def _create_output_file(path: str, grid: OceanGrid) -> nc.Dataset:
 def _append_snapshot(ds: nc.Dataset, state: OceanState) -> None:
     """Append the current state as one time record."""
     i = len(ds.variables["time"])
-    ds.variables["time"][i]        = float(state.time)
-    ds.variables["T"][i, :, :, :]  = np.array(state.T)
-    ds.variables["S"][i, :, :, :]  = np.array(state.S)
-    ds.variables["eta"][i, :, :]   = np.array(state.eta)
+    ds.variables["time"][i]       = float(state.time)
+    ds.variables["T"][i, :, :, :] = np.array(state.T)
+    ds.variables["S"][i, :, :, :] = np.array(state.S)
+    ds.variables["eta"][i, :, :]  = np.array(state.eta)
     ds.sync()
 
 
@@ -188,9 +224,7 @@ def _append_snapshot(ds: nc.Dataset, state: OceanState) -> None:
 # ---------------------------------------------------------------------------
 
 def _print_diag(step: int, n_steps: int, state: OceanState, wall_dt: float) -> bool:
-    """
-    Print one diagnostic line to stderr.  Returns True if NaN is detected.
-    """
+    """Print one diagnostic line to stderr.  Returns True if NaN is detected."""
     T   = np.array(state.T)
     S   = np.array(state.S)
     eta = np.array(state.eta)
@@ -220,7 +254,7 @@ def main(argv=None) -> None:
 
     # --- build grid ---
     dz = args.depth_max / args.nz
-    depth_levels = (np.arange(args.nz) + 0.5) * dz   # cell centres, positive down
+    depth_levels = (np.arange(args.nz) + 0.5) * dz
     grid = OceanGrid.create(
         lon_bounds=(args.lon_min, args.lon_max),
         lat_bounds=(args.lat_min, args.lat_max),
@@ -229,68 +263,59 @@ def main(argv=None) -> None:
         Ny=args.ny,
     )
 
-    # --- model parameters ---
+    # --- model parameters and initial state ---
     params = ModelParams(dt=args.dt)
+    state  = create_rest_state(grid, T_background=args.T_bg, S_background=args.S_bg)
 
-    # --- initial state ---
-    state = create_rest_state(grid, T_background=args.T_bg, S_background=args.S_bg)
-
-    # --- constant surface forcing ---
-    any_forcing = any([
-        args.heat_flux != 0.0,
-        args.fw_flux   != 0.0,
-        args.tau_x     != 0.0,
-        args.tau_y     != 0.0,
-    ])
-    if any_forcing:
-        ones = jnp.ones((args.chunk_size, grid.Nx, grid.Ny), dtype=jnp.float32)
-        forcing_seq: SurfaceForcing | None = SurfaceForcing(
-            heat_flux = ones * args.heat_flux,
-            fw_flux   = ones * args.fw_flux,
-            tau_x     = ones * args.tau_x,
-            tau_y     = ones * args.tau_y,
-        )
-    else:
-        forcing_seq = None
-
-    # --- JIT-compile the scan loop ---
-    # n_steps and save_history are static (affect trace structure).
+    # --- JIT-compiled scan loop ---
+    # n_steps is static: JAX caches a separate compiled trace per unique value,
+    # so full chunks and the partial final chunk compile independently.
     run_jit = jax.jit(ocean_run, static_argnames=("n_steps", "save_history"))
 
+    # --- chunk schedule: full chunks + optional partial remainder ---
+    n_full, remainder = divmod(args.n_steps, args.chunk_size)
+    chunk_sizes = [args.chunk_size] * n_full
+    if remainder > 0:
+        chunk_sizes.append(remainder)
+
     # --- open output file and save t=0 ---
-    ds = _create_output_file(args.output, grid)
+    ds = _create_output_file(args.output, grid, args)
     _append_snapshot(ds, state)
     print(f"Output: {args.output}  (t=0 saved)", file=sys.stderr)
 
-    # --- integration loop ---
-    n_chunks   = args.n_steps // args.chunk_size
-    steps_done = 0
+    steps_done     = 0
+    next_save_step = args.save_interval
 
-    for chunk_idx in range(n_chunks):
-        t0 = _time.perf_counter()
+    try:
+        for chunk_steps in chunk_sizes:
+            t0 = _time.perf_counter()
 
-        state, _ = run_jit(
-            state, grid, params,
-            n_steps=args.chunk_size,
-            forcing_sequence=forcing_seq,
-            save_history=False,
-        )
-        # Block until JAX async dispatch completes before timing and printing.
-        jax.block_until_ready(state.T)
+            forcing_seq = _make_forcing(chunk_steps, args, grid)
+            state, _ = run_jit(
+                state, grid, params,
+                n_steps=chunk_steps,
+                forcing_sequence=forcing_seq,
+                save_history=False,
+            )
+            jax.block_until_ready(state.T)
 
-        wall_dt     = _time.perf_counter() - t0
-        steps_done += args.chunk_size
+            wall_dt     = _time.perf_counter() - t0
+            steps_done += chunk_steps
 
-        if steps_done % args.save_interval == 0:
-            _append_snapshot(ds, state)
+            # Save at most once per chunk, but advance past all crossed thresholds.
+            if steps_done >= next_save_step:
+                _append_snapshot(ds, state)
+                while next_save_step <= steps_done:
+                    next_save_step += args.save_interval
 
-        has_nan = _print_diag(steps_done, args.n_steps, state, wall_dt)
-        if has_nan:
-            print("ERROR: NaN detected — aborting.", file=sys.stderr)
-            ds.close()
-            sys.exit(1)
+            has_nan = _print_diag(steps_done, args.n_steps, state, wall_dt)
+            if has_nan:
+                print("ERROR: NaN detected — aborting.", file=sys.stderr)
+                sys.exit(1)
 
-    ds.close()
+    finally:
+        ds.close()
+
     print(f"Done. {steps_done} steps written to {args.output}", file=sys.stderr)
 
 
