@@ -210,6 +210,11 @@ def implicit_vertical_mix(
     else:
         rhs = phi + dt * rhs_explicit
 
+    # Accept scalar kappa (e.g. params.kappa_v) and broadcast to (Nx, Ny, Nz+1)
+    Nx, Ny, Nz = phi.shape
+    if jnp.ndim(kappa) == 0:
+        kappa = jnp.full((Nx, Ny, Nz + 1), kappa)
+
     def solve_column(phi_col, kappa_col, rhs_col, mask_w_col, mask_c_col):
         """Solve one (i,j) column. All inputs are 1-D in z."""
         a, b, c = _build_tridiag_implicit(
@@ -222,11 +227,16 @@ def implicit_vertical_mix(
         return phi_new * mask_c_col
 
     # vmap over (i, j) simultaneously by flattening the horizontal dims
-    Nx, Ny, Nz = phi.shape
     phi_2d    = phi.reshape(Nx * Ny, Nz)
     kappa_2d  = kappa.reshape(Nx * Ny, Nz + 1)
     rhs_2d    = rhs.reshape(Nx * Ny, Nz)
-    mask_w_2d = grid.mask_w.reshape(Nx * Ny, Nz + 1)
+    # Use mask_w_adv (surface face k=0 always closed) so that the implicit
+    # diffusion operator has no flux through the sea surface.  The surface
+    # tracer exchange is handled exclusively by the explicit forcing tendencies
+    # in tracers.py, exactly as for tracer advection.  Using mask_w here would
+    # open a spurious diffusive flux at k=0 (a[0] ≠ 0 in the tridiagonal
+    # system), corrupting the top-layer temperature even in a resting ocean.
+    mask_w_2d = grid.mask_w_adv.reshape(Nx * Ny, Nz + 1)
     mask_c_2d = grid.mask_c.reshape(Nx * Ny, Nz)
 
     phi_new_2d = jax.vmap(solve_column)(
@@ -267,6 +277,10 @@ def implicit_vertical_visc(
         vel^{n+1} : (Nx, Ny, Nz)
     """
     Nx, Ny, Nz = vel.shape
+
+    # Accept scalar nu_v (e.g. params.nu_v) and broadcast to (Nx, Ny, Nz+1)
+    if jnp.ndim(nu_v) == 0:
+        nu_v = jnp.full((Nx, Ny, Nz + 1), nu_v)
 
     # Build the vertical face mask consistent with this velocity component.
     # Face k is open only when both adjacent velocity layers are wet.

@@ -1,0 +1,15 @@
+# OceanJAX dependencies
+# ----------------------
+# Core compute
+jax>=0.4.25
+jaxlib>=0.4.25
+equinox>=0.11.0
+numpy>=1.26
+
+# Testing
+pytest>=8.0
+
+# Data loading (for ORAS5 initialisation – optional until data module is implemented)
+xarray>=2024.1
+netCDF4>=1.6
+scipy>=1.12
