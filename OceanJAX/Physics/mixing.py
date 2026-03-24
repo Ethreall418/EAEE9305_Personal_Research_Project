@@ -15,7 +15,7 @@ Vertical diffusion is treated **implicitly**: the time stepper calls
 
 where L_v is the vertical diffusion operator, and returns phi^{n+1}
 directly.  This avoids the severe stability constraint that would arise
-from an explicit vertical diffusion step.
+from an explicit vertical  diffusion step.
 
 Horizontal viscosity and diffusion are treated **explicitly** and return
 tendencies that the time stepper adds before advancing.
@@ -25,18 +25,33 @@ Contents
 thomas_algorithm          – differentiable tridiagonal solver via lax.scan
 implicit_vertical_mix     – implicit vertical diffusion for tracers
 implicit_vertical_visc    – implicit vertical diffusion for velocities (u or v)
-horizontal_viscosity      – Laplacian viscosity tendency for u / v
-richardson_number         – local gradient Richardson number
-kpp_diffusivity           – simplified KPP vertical diffusivity
+                            uses velocity-consistent vertical face masks
+_laplacian_u / _v         – scalar Laplacian at u- / v-points with correct metrics
+horizontal_viscosity      – Laplacian viscosity tendency for (u, v)
+richardson_number         – raw (unclipped) gradient Richardson number
+ri_based_diffusivity      – Richardson-number shear/convection diffusivity
 """
 
 from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
 from OceanJAX.grid import OceanGrid
+
+
+# ---------------------------------------------------------------------------
+# Module-level utility
+# ---------------------------------------------------------------------------
+
+def _diff_w(phi: jnp.ndarray) -> jnp.ndarray:
+    """
+    Centred vertical difference of phi at w-faces, shape (Nx, Ny, Nz+1).
+    Interior faces k=1..Nz-1 get phi[k] - phi[k-1]; boundary faces are zero.
+    """
+    interior = phi[..., 1:] - phi[..., :-1]
+    zeros    = jnp.zeros(phi.shape[:2] + (1,), dtype=phi.dtype)
+    return jnp.concatenate([zeros, interior, zeros], axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -234,20 +249,30 @@ def implicit_vertical_visc(
     """
     Implicitly mix a horizontal velocity component in the vertical direction.
 
-    Identical structure to ``implicit_vertical_mix`` but uses the supplied
-    velocity mask (mask_u or mask_v) instead of mask_c / mask_w.
+    Uses a velocity-consistent vertical face mask: internal face k is active
+    only when both ``mask[..., k-1]`` and ``mask[..., k]`` are 1, matching the
+    actual grid locations of u or v rather than the tracer mask_w.  Using the
+    tracer mask_w would incorrectly couple layers at seamount edges where a
+    u- or v-column is entirely dry despite adjacent tracer columns being wet.
 
     Args:
         vel   : (Nx, Ny, Nz)    velocity component at time n
         nu_v  : (Nx, Ny, Nz+1) vertical viscosity at w-faces [m² s⁻¹]
         dt    : timestep [s]
         grid  : OceanGrid
-        mask  : (Nx, Ny, Nz)   mask for this velocity component
+        mask  : (Nx, Ny, Nz)   wet mask for this velocity component
+                                (mask_u for u, mask_v for v)
 
     Returns:
         vel^{n+1} : (Nx, Ny, Nz)
     """
     Nx, Ny, Nz = vel.shape
+
+    # Build the vertical face mask consistent with this velocity component.
+    # Face k is open only when both adjacent velocity layers are wet.
+    # Surface (k=0) and bottom (k=Nz) are always closed (no-flux BC).
+    mask_w_vel = jnp.zeros((Nx, Ny, Nz + 1), dtype=mask.dtype)
+    mask_w_vel = mask_w_vel.at[:, :, 1:Nz].set(mask[:, :, :-1] * mask[:, :, 1:])
 
     def solve_column(vel_col, nu_col, mask_w_col, mask_col):
         a, b, c = _build_tridiag_implicit(
@@ -257,7 +282,7 @@ def implicit_vertical_visc(
 
     vel_2d    = vel.reshape(Nx * Ny, Nz)
     nu_2d     = nu_v.reshape(Nx * Ny, Nz + 1)
-    mask_w_2d = grid.mask_w.reshape(Nx * Ny, Nz + 1)
+    mask_w_2d = mask_w_vel.reshape(Nx * Ny, Nz + 1)
     mask_2d   = mask.reshape(Nx * Ny, Nz)
 
     vel_new_2d = jax.vmap(solve_column)(vel_2d, nu_2d, mask_w_2d, mask_2d)
@@ -265,46 +290,145 @@ def implicit_vertical_visc(
 
 
 # ---------------------------------------------------------------------------
-# Horizontal viscosity (explicit Laplacian)
+# Horizontal viscosity (explicit Laplacian at velocity points)
 # ---------------------------------------------------------------------------
 
+def _laplacian_u(
+    u:    jnp.ndarray,
+    nu_h: float | jnp.ndarray,
+    grid: OceanGrid,
+) -> jnp.ndarray:
+    """
+    Scalar horizontal Laplacian of u at u-points (east faces).
+
+    Uses the geometry of the u-point grid cell:
+
+      x-direction
+        Neighbours : u[i-1] and u[i+1]  (adjacent east faces)
+        Spacing    : dx_c[i]   (west gap) and dx_c[i+1] (east gap)
+        Face height: dy_c[j]
+        Cell area  : 0.5 * (dx_c[i] + dx_c[i+1]) * dy_c[j]
+
+      y-direction
+        Neighbours : u[i,j-1] and u[i,j+1]  (same east face, adjacent rows)
+        Spacing    : dy_v[j]  (= dy_c[j], distance between tracer-centre rows)
+        Face width : dx_v[j]  (zonal width at north-face latitude lat_v[j])
+
+    Face masks gate fluxes through faces that adjoin a dry u-point.
+    Output is zeroed at dry u-points via mask_u.
+
+    This is a scalar approximation; the full vector Laplacian on a spherical
+    C-grid also includes off-diagonal stress terms that are neglected here.
+    """
+    Nx, Ny, Nz = u.shape
+
+    # ---- x-direction -------------------------------------------------------
+    u_e      = jnp.roll(u, -1, axis=0)                            # u[i+1]
+    # Distance from u[i] to u[i+1] = width of tracer cell i+1
+    dist_e   = jnp.roll(grid.dx_c, -1, axis=0)[:, :, jnp.newaxis]
+    # Gate: both u[i] and u[i+1] must be active (periodic in x)
+    mu_ee    = grid.mask_u * jnp.roll(grid.mask_u, -1, axis=0)
+    fx_e     = nu_h * grid.dy_c[:, :, jnp.newaxis] * (u_e - u) / dist_e * mu_ee
+    fx_w     = jnp.roll(fx_e, 1, axis=0)
+
+    # ---- y-direction -------------------------------------------------------
+    u_n      = jnp.roll(u, -1, axis=1)                            # u[i,j+1]
+    # Gate: both u-rows active; north wall explicitly closed
+    mu_nn    = (grid.mask_u * jnp.roll(grid.mask_u, -1, axis=1)
+                ).at[:, -1, :].set(0.0)
+    fy_n     = nu_h * grid.dx_v[:, :, jnp.newaxis] * (u_n - u) / grid.dy_v[:, :, jnp.newaxis] * mu_nn
+    fy_s     = jnp.concatenate(
+        [jnp.zeros((Nx, 1, Nz), dtype=u.dtype), fy_n[:, :-1, :]], axis=1
+    )
+
+    # ---- u-cell area -------------------------------------------------------
+    area_u = 0.5 * (grid.dx_c + jnp.roll(grid.dx_c, -1, axis=0)) * grid.dy_c
+
+    return ((fx_e - fx_w + fy_n - fy_s) / area_u[:, :, jnp.newaxis]) * grid.mask_u
+
+
+def _laplacian_v(
+    v:    jnp.ndarray,
+    nu_h: float | jnp.ndarray,
+    grid: OceanGrid,
+) -> jnp.ndarray:
+    """
+    Scalar horizontal Laplacian of v at v-points (north faces).
+
+    Uses the geometry of the v-point grid cell:
+
+      x-direction
+        Neighbours : v[i-1,j] and v[i+1,j]  (adjacent north faces)
+        Spacing    : 0.5*(dx_v[i] + dx_v[i+1])  (distance between v-columns)
+        Face height: dy_v[j]
+        Cell area  : dx_v[j] * dy_v[j]
+
+      y-direction
+        Neighbours : v[i,j-1] and v[i,j+1]  (same north face, adjacent rows)
+        v[j] at lat_v[j]; v[j+1] at lat_v[j+1]
+        Spacing    : dy_c[j+1]  (height of tracer cell j+1)
+        Face width : dx_c[j+1]  (zonal width at lat_c[j+1], midpoint of v-gap)
+
+    Face masks gate fluxes through faces that adjoin a dry v-point.
+    Output is zeroed at dry v-points via mask_v.
+    """
+    Nx, Ny, Nz = v.shape
+
+    # ---- x-direction -------------------------------------------------------
+    v_e      = jnp.roll(v, -1, axis=0)
+    # Distance between v[i] and v[i+1] ≈ 0.5*(dx_v[i] + dx_v[i+1])
+    dist_e   = 0.5 * (grid.dx_v + jnp.roll(grid.dx_v, -1, axis=0))[:, :, jnp.newaxis]
+    mv_ee    = grid.mask_v * jnp.roll(grid.mask_v, -1, axis=0)
+    fx_e     = nu_h * grid.dy_v[:, :, jnp.newaxis] * (v_e - v) / dist_e * mv_ee
+    fx_w     = jnp.roll(fx_e, 1, axis=0)
+
+    # ---- y-direction -------------------------------------------------------
+    v_n      = jnp.roll(v, -1, axis=1)                            # v[i,j+1]
+    # Distance from v[j] (lat_v[j]) to v[j+1] (lat_v[j+1]) = dy_c[j+1]
+    dist_n   = jnp.roll(grid.dy_c, -1, axis=1)[:, :, jnp.newaxis]
+    # Face width at midpoint between v-rows ≈ dx_c[j+1]
+    width_n  = jnp.roll(grid.dx_c, -1, axis=1)[:, :, jnp.newaxis]
+    mv_nn    = (grid.mask_v * jnp.roll(grid.mask_v, -1, axis=1)
+                ).at[:, -1, :].set(0.0)
+    fy_n     = nu_h * width_n * (v_n - v) / dist_n * mv_nn
+    fy_s     = jnp.concatenate(
+        [jnp.zeros((Nx, 1, Nz), dtype=v.dtype), fy_n[:, :-1, :]], axis=1
+    )
+
+    # ---- v-cell area -------------------------------------------------------
+    area_v = grid.dx_v * grid.dy_v   # dx_v[j] * dy_c[j]
+
+    return ((fx_e - fx_w + fy_n - fy_s) / area_v[:, :, jnp.newaxis]) * grid.mask_v
+
+
 def horizontal_viscosity(
-    u:     jnp.ndarray,
-    v:     jnp.ndarray,
-    nu_h:  float | jnp.ndarray,
-    grid:  OceanGrid,
+    u:    jnp.ndarray,
+    v:    jnp.ndarray,
+    nu_h: float | jnp.ndarray,
+    grid: OceanGrid,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Explicit horizontal Laplacian viscosity tendencies for (u, v).
 
-    Each velocity component is treated as a scalar field and passed through
-    the same flux-form Laplacian used for tracers, with the appropriate
-    face mask.
+    Delegates to ``_laplacian_u`` and ``_laplacian_v``, which use the correct
+    grid-cell geometry and masks for each velocity point rather than the
+    tracer-cell metrics used by ``kappa_laplacian_h``.
 
-    For u (on east faces, mask_u):
-      nu_h * lap_h(u)  at u-points
-
-    For v (on north faces, mask_v):
-      nu_h * lap_h(v)  at v-points
-
-    Note: a geometrically consistent viscosity on the C-grid requires the
-    full vector Laplacian, including off-diagonal stress terms, which are
-    absent here.  This scalar approximation is standard in z-level models
-    at moderate resolution.
+    This is a scalar Laplacian approximation.  The full vector Laplacian on
+    a spherical C-grid includes off-diagonal stress terms that are omitted
+    here; they are second-order corrections relevant mainly at very high
+    resolution or when modelling viscous boundary layers.
 
     Args:
-        u    : (Nx, Ny, Nz) zonal velocity
-        v    : (Nx, Ny, Nz) meridional velocity
+        u    : (Nx, Ny, Nz) zonal velocity at east faces
+        v    : (Nx, Ny, Nz) meridional velocity at north faces
         nu_h : scalar or (Nx, Ny, Nz) horizontal viscosity [m² s⁻¹]
         grid : OceanGrid
 
     Returns:
         (du_dt_visc, dv_dt_visc) : each (Nx, Ny, Nz)
     """
-    from OceanJAX.Physics.tracers import kappa_laplacian_h   # avoid circular at module level
-    du = kappa_laplacian_h(u, nu_h, grid)
-    dv = kappa_laplacian_h(v, nu_h, grid)
-    return du, dv
+    return _laplacian_u(u, nu_h, grid), _laplacian_v(v, nu_h, grid)
 
 
 # ---------------------------------------------------------------------------
@@ -320,50 +444,47 @@ def richardson_number(
     params,
 ) -> jnp.ndarray:
     """
-    Gradient Richardson number at w-faces (Nx, Ny, Nz+1).
+    Raw gradient Richardson number at w-faces (Nx, Ny, Nz+1).
 
-      Ri = N² / (du/dz)²
+      Ri = N² / S²
 
     where N² is the squared buoyancy frequency:
 
-      N² = -(g / rho0) * drho/dz   (positive = stable)
+      N² = -(g / rho0) * drho/dz   (positive = stably stratified, negative = unstable)
 
-    and the velocity shear squared:
+    and S² is the velocity shear squared:
 
       S² = (du/dz)² + (dv/dz)²
 
     Both are evaluated at w-faces using centred differences.
-    A small floor on S² prevents division by zero.
+    A small floor on S² prevents division by zero, but the returned Ri is
+    **not clipped**: negative values indicate static instability and must
+    be preserved for diagnostic use.  Closures that need a bounded Ri
+    (e.g. ``ri_based_diffusivity``) apply their own clamping internally.
 
     Args:
-        T, S  : (Nx, Ny, Nz) temperature and salinity
-        u, v  : (Nx, Ny, Nz) horizontal velocities
-        grid  : OceanGrid
-        params: ModelParams
+        T, S   : (Nx, Ny, Nz) temperature and salinity
+        u, v   : (Nx, Ny, Nz) horizontal velocities
+        grid   : OceanGrid
+        params : ModelParams
 
     Returns:
-        Ri : (Nx, Ny, Nz+1), clamped to [0, Ri_max]
+        Ri : (Nx, Ny, Nz+1), raw (possibly negative), zeroed at dry w-faces
     """
     from OceanJAX.Physics.dynamics import equation_of_state  # deferred
 
-    rho = equation_of_state(T, S, params)   # (Nx, Ny, Nz)
+    rho       = equation_of_state(T, S, params)   # (Nx, Ny, Nz)
+    safe_dz_w = jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
 
-    # Centred vertical differences at w-faces (same stencil as grad_z)
-    # Interior faces k=1..Nz-1; boundaries set to 0
-    def _diff_w(phi):
-        interior = phi[..., 1:] - phi[..., :-1]   # (Nx, Ny, Nz-1)
-        zeros    = jnp.zeros(phi.shape[:2] + (1,), dtype=phi.dtype)
-        return jnp.concatenate([zeros, interior, zeros], axis=-1)  # (Nx, Ny, Nz+1)
+    drho_dz = _diff_w(rho) / safe_dz_w
+    du_dz   = _diff_w(u)   / safe_dz_w
+    dv_dz   = _diff_w(v)   / safe_dz_w
 
-    drho_dz = _diff_w(rho) / jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
-    du_dz   = _diff_w(u)   / jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
-    dv_dz   = _diff_w(v)   / jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
+    n2 = -(params.g / params.rho0) * drho_dz
+    s2 = du_dz ** 2 + dv_dz ** 2
 
-    n2 = -(params.g / params.rho0) * drho_dz   # (Nx, Ny, Nz+1)
-    s2 = du_dz ** 2 + dv_dz ** 2               # shear squared
-
+    # Return raw Ri; no clipping — negative Ri signals static instability
     ri = n2 / jnp.where(s2 > 1e-10, s2, 1e-10)
-    ri = jnp.clip(ri, 0.0, 100.0)              # clamp to [0, Ri_max]
     return ri * grid.mask_w
 
 
@@ -371,7 +492,7 @@ def richardson_number(
 # Simplified KPP vertical diffusivity
 # ---------------------------------------------------------------------------
 
-def kpp_diffusivity(
+def ri_based_diffusivity(
     T:     jnp.ndarray,
     S:     jnp.ndarray,
     u:     jnp.ndarray,
@@ -383,64 +504,58 @@ def kpp_diffusivity(
     ri_crit:    float = 0.7,
 ) -> jnp.ndarray:
     """
-    Simplified KPP-inspired vertical diffusivity for tracers.
+    Richardson-number-based vertical diffusivity for tracers.
 
-    The scheme enhances the background diffusivity when the gradient
-    Richardson number falls below a critical value and applies convective
-    adjustment (large diffusivity) in statically unstable columns:
+    Enhances a background diffusivity with shear-driven mixing when the
+    gradient Richardson number falls below a critical value, and applies
+    a convective-adjustment diffusivity in statically unstable layers:
 
-      kappa_v(k) = kappa_0
-                 + kappa_conv * max(0, 1 - Ri / Ri_crit)²   if Ri < Ri_crit
-                 + kappa_conv                                 if N² < 0
+      kappa(k) = kappa_0
+               + kappa_conv * (1 - Ri / Ri_crit)²   if 0 <= Ri < Ri_crit
+               + kappa_conv                           if N² < 0  (convective)
 
-    This is a single-function approximation to the full KPP scheme
-    (Large et al. 1994) without an explicit boundary-layer depth calculation.
-    It is sufficient for stable multi-year integrations and can be replaced
-    by an ML closure (see OceanJAX.ml.closure) or a more complete KPP
-    implementation without changing the calling interface.
+    This is **not** a full KPP scheme (Large et al. 1994): it omits the
+    boundary-layer depth, counter-gradient fluxes, and nonlocal transport.
+    It provides a physically motivated background mixing suitable for
+    multi-year integrations and can be swapped for an ML closure
+    (``OceanJAX.ml.closure``) without changing the calling interface.
+
+    The raw Richardson number is computed internally.  Clamping to
+    [0, Ri_crit] is applied here, not in ``richardson_number``, so that
+    the diagnostic function preserves the full signed Ri signal.
 
     Args:
         T, S        : (Nx, Ny, Nz)
         u, v        : (Nx, Ny, Nz)
         grid        : OceanGrid
-        params      : ModelParams  (uses g, rho0, kappa_v as background)
+        params      : ModelParams  (uses g, rho0)
         kappa_0     : background diffusivity [m² s⁻¹]  (default 1e-5)
-        kappa_conv  : convective diffusivity [m² s⁻¹]  (default 0.1)
-        ri_crit     : critical Richardson number        (default 0.7)
+        kappa_conv  : shear / convective diffusivity [m² s⁻¹]  (default 0.1)
+        ri_crit     : critical Richardson number for shear mixing (default 0.7)
 
     Returns:
         kappa : (Nx, Ny, Nz+1) [m² s⁻¹], zeroed at dry w-faces
     """
-    from OceanJAX.Physics.dynamics import equation_of_state  # deferred
+    # Reuse the diagnostic Ri, then clamp internally for the closure
+    ri = richardson_number(T, S, u, v, grid, params)   # raw, possibly negative
 
+    # N² is needed separately to detect convective instability
+    from OceanJAX.Physics.dynamics import equation_of_state  # deferred
     rho = equation_of_state(T, S, params)
 
-    def _diff_w(phi):
-        interior = phi[..., 1:] - phi[..., :-1]
-        zeros    = jnp.zeros(phi.shape[:2] + (1,), dtype=phi.dtype)
-        return jnp.concatenate([zeros, interior, zeros], axis=-1)
-
     safe_dz_w = jnp.where(grid.dz_w > 0, grid.dz_w, 1.0)
-    drho_dz   = _diff_w(rho) / safe_dz_w
-    du_dz     = _diff_w(u)   / safe_dz_w
-    dv_dz     = _diff_w(v)   / safe_dz_w
+    n2 = -(params.g / params.rho0) * _diff_w(rho) / safe_dz_w
 
-    n2  = -(params.g / params.rho0) * drho_dz
-    s2  = du_dz ** 2 + dv_dz ** 2
-    ri  = n2 / jnp.where(s2 > 1e-10, s2, 1e-10)
-
-    # Shear-driven enhancement: active when 0 <= Ri < ri_crit
-    shear_factor = jnp.where(
-        (ri >= 0) & (ri < ri_crit),
-        (1.0 - ri / ri_crit) ** 2,
+    # Shear enhancement: (1 - Ri/Ri_crit)² for 0 <= Ri < Ri_crit
+    ri_clamped    = jnp.clip(ri, 0.0, ri_crit)
+    shear_factor  = jnp.where(
+        (ri >= 0.0) & (ri < ri_crit),
+        (1.0 - ri_clamped / ri_crit) ** 2,
         0.0,
     )
 
-    # Convective adjustment: active when N² < 0 (unstable column)
-    conv_factor = jnp.where(n2 < 0, 1.0, 0.0)
+    # Convective adjustment: N² < 0
+    conv_factor = jnp.where(n2 < 0.0, 1.0, 0.0)
 
-    kappa = (kappa_0
-             + kappa_conv * shear_factor
-             + kappa_conv * conv_factor)
-
+    kappa = kappa_0 + kappa_conv * (shear_factor + conv_factor)
     return kappa * grid.mask_w
