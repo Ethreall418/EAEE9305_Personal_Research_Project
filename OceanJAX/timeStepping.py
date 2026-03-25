@@ -11,11 +11,14 @@ Momentum  — Leapfrog with Asselin-Robert filter (suppresses the computational
              implicitly after the leapfrog advance.
 
 Tracers   — Adams-Bashforth 3rd order (AB3) for the explicit part; vertical
-             diffusion is applied implicitly afterwards.  The two previous
-             tendencies stored in OceanState are used for the AB3 weights.
-             For the first two steps the history fields are zero, so the
-             scheme degrades gracefully to AB1 → AB2; the error is confined
-             to the startup transient and does not affect long integrations.
+             diffusion is applied implicitly afterwards.  The AB order is
+             selected explicitly by ``state.step_count``:
+               step_count == 0  →  AB1  (Forward Euler; coefficients 1, 0, 0)
+               step_count == 1  →  AB2  (coefficients 3/2, -1/2, 0)
+               step_count >= 2  →  AB3  (coefficients 23/12, -16/12, 5/12)
+             This replaces the older "zero-history" bootstrap (which produced
+             the same first step but could silently mis-apply AB2 coefficients
+             if ``T_tend_prev`` was ever non-zero at step 0).
 
 Free surface — Forward Euler update from the depth-integrated divergence.
                The diagnosed w field is then updated so that its surface face
@@ -373,6 +376,15 @@ def run(
             length=n_steps,
         )
     else:
+        # Validate that the forcing leading axis matches n_steps so that a
+        # shape mismatch is caught here rather than inside jax.lax.scan
+        # (where the error message is harder to interpret).
+        seq_len = jax.tree_util.tree_leaves(forcing_sequence)[0].shape[0]
+        if seq_len != n_steps:
+            raise ValueError(
+                f"forcing_sequence leading axis length ({seq_len}) does not "
+                f"match n_steps ({n_steps})."
+            )
         final_state, history = jax.lax.scan(
             _step_fn,
             state,

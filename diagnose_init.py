@@ -4,7 +4,7 @@ diagnose_init.py
 Lightweight ORAS5 → OceanState diagnostic.
 
 Loads an ORAS5 file onto an OceanJAX grid and prints a summary table of
-the initial-condition fields (min, max, mean, non-zero count, NaN count).
+the initial-condition fields (min, max, mean, non-zero count, non-finite count).
 Optionally saves PNG figures of the surface T/S and the first zonal T section.
 
 Usage
@@ -76,10 +76,10 @@ def _stats(name: str, arr: np.ndarray, ocean_mask: np.ndarray) -> None:
     if ocean.size == 0:
         print(f"  {name:8s}  (no ocean cells)")
         return
-    nan_count = int(np.sum(np.isnan(ocean)))
-    valid     = ocean[~np.isnan(ocean)]
+    not_finite_count = int(np.sum(~np.isfinite(ocean)))
+    valid            = ocean[np.isfinite(ocean)]
     if valid.size == 0:
-        print(f"  {name:8s}  ALL NaN  ({nan_count} cells)")
+        print(f"  {name:8s}  ALL non-finite  ({not_finite_count} cells)")
         return
     print(
         f"  {name:8s}  "
@@ -87,7 +87,7 @@ def _stats(name: str, arr: np.ndarray, ocean_mask: np.ndarray) -> None:
         f"max={valid.max():+10.4f}  "
         f"mean={valid.mean():+10.4f}  "
         f"nonzero={int(np.count_nonzero(valid)):6d}/{valid.size:6d}  "
-        f"NaN={nan_count}"
+        f"non-finite={not_finite_count}"
     )
 
 
@@ -216,22 +216,24 @@ def main(argv=None) -> None:
     _stats("eta", np.array(state.eta), mask2d)
     print("-" * 72)
 
-    # Overall NaN check (ocean cells only, per staggered mask)
+    # Overall non-finite check (ocean cells only, per staggered mask).
+    # isfinite catches both NaN and Inf so blow-up during initialisation
+    # is detected before the first time step.
     T_arr   = np.array(state.T)
     S_arr   = np.array(state.S)
     u_arr   = np.array(state.u)
     v_arr   = np.array(state.v)
     eta_arr = np.array(state.eta)
-    any_nan = bool(
-        np.any(np.isnan(T_arr[mask_c]))   or
-        np.any(np.isnan(S_arr[mask_c]))   or
-        np.any(np.isnan(u_arr[mask_u]))   or
-        np.any(np.isnan(v_arr[mask_v]))   or
-        np.any(np.isnan(eta_arr[mask2d]))
+    any_not_finite = bool(
+        np.any(~np.isfinite(T_arr[mask_c]))   or
+        np.any(~np.isfinite(S_arr[mask_c]))   or
+        np.any(~np.isfinite(u_arr[mask_u]))   or
+        np.any(~np.isfinite(v_arr[mask_v]))   or
+        np.any(~np.isfinite(eta_arr[mask2d]))
     )
-    print(f"\nNaN present (ocean cells): {any_nan}")
-    if any_nan:
-        print("WARNING: NaN detected in initial state!", file=sys.stderr)
+    print(f"\nnon-finite present (ocean cells): {any_not_finite}")
+    if any_not_finite:
+        print("WARNING: non-finite value detected in initial state!", file=sys.stderr)
 
     if args.plot:
         print("\nGenerating figures …", file=sys.stderr)

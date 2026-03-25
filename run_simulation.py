@@ -17,7 +17,7 @@ The script:
   4. Integrates forward using chunked jax.lax.scan calls.
   5. Writes T, S, eta snapshots to a NetCDF file whenever the step counter
      crosses a save-interval boundary (independent of chunk_size).
-  6. Prints per-chunk diagnostics (step, time, T/S/eta range, NaN flag, wall-clock).
+  6. Prints per-chunk diagnostics (step, time, T/S/eta range, non-finite flag, wall-clock).
 
 Chunking vs. saving
 -------------------
@@ -286,18 +286,20 @@ def _append_snapshot(ds: nc.Dataset, state: OceanState) -> None:
 # ---------------------------------------------------------------------------
 
 def _print_diag(step: int, n_steps: int, state: OceanState, wall_dt: float) -> bool:
-    """Print one diagnostic line to stderr.  Returns True if NaN is detected."""
+    """Print one diagnostic line to stderr.  Returns True if any non-finite value is detected."""
     T   = np.array(state.T)
     S   = np.array(state.S)
     u   = np.array(state.u)
     v   = np.array(state.v)
     eta = np.array(state.eta)
-    has_nan = bool(
-        np.any(np.isnan(T))   or
-        np.any(np.isnan(S))   or
-        np.any(np.isnan(u))   or
-        np.any(np.isnan(v))   or
-        np.any(np.isnan(eta))
+    # Use isfinite rather than isnan to also catch Inf values (e.g. blow-up
+    # before the field reaches NaN).
+    not_finite = bool(
+        np.any(~np.isfinite(T))   or
+        np.any(~np.isfinite(S))   or
+        np.any(~np.isfinite(u))   or
+        np.any(~np.isfinite(v))   or
+        np.any(~np.isfinite(eta))
     )
 
     print(
@@ -306,12 +308,12 @@ def _print_diag(step: int, n_steps: int, state: OceanState, wall_dt: float) -> b
         f"T=[{T.min():.4f}, {T.max():.4f}]  "
         f"S=[{S.min():.4f}, {S.max():.4f}]  "
         f"eta=[{eta.min():.5f}, {eta.max():.5f}]  "
-        f"NaN={has_nan}  "
+        f"non-finite={not_finite}  "
         f"wall={wall_dt:.2f}s",
         file=sys.stderr,
         flush=True,
     )
-    return has_nan
+    return not_finite
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +376,7 @@ def main(argv=None) -> None:
             # NaN check before writing — avoids saving a corrupted snapshot.
             has_nan = _print_diag(steps_done, args.n_steps, state, wall_dt)
             if has_nan:
-                print("ERROR: NaN detected — aborting.", file=sys.stderr)
+                print("ERROR: non-finite value detected — aborting.", file=sys.stderr)
                 sys.exit(1)
 
             if steps_done == next_save_step:
