@@ -20,7 +20,10 @@ Tracers   — Adams-Bashforth 3rd order (AB3) for the explicit part; vertical
              the same first step but could silently mis-apply AB2 coefficients
              if ``T_tend_prev`` was ever non-zero at step 0).
 
-Free surface — Forward Euler update from the depth-integrated divergence.
+Free surface — Leapfrog update (eta_prev + 2*dt * deta_dt), consistent with
+               the momentum leapfrog, with an Asselin-Robert filter on eta.
+               Bootstrap at step_count == 0: uses 1*dt (Forward Euler start),
+               identical to the momentum bootstrap.
                The diagnosed w field is then updated so that its surface face
                (k=0) carries the kinematic signal w[0] = deta/dt.
 
@@ -285,10 +288,16 @@ def step(
                                   rhs_explicit=jnp.zeros_like(S_new))
 
     # ------------------------------------------------------------------
-    # 9. Free-surface update
+    # 9. Free-surface update (leapfrog, consistent with momentum)
+    #    Bootstrap (step_count == 0): 1*dt Forward Euler start so that
+    #    eta_prev = eta gives eta_new = eta + dt*deta_dt.
+    #    Subsequent steps: eta_new = eta_prev + 2*dt * deta_dt.
+    #    Asselin-Robert filter applied to current eta (same alpha as u/v).
     # ------------------------------------------------------------------
-    deta_dt = free_surface_tendency(u_filt, v_filt, grid)
-    eta_new = (state.eta + dt * deta_dt) * grid.mask_c[:, :, 0]
+    deta_dt   = free_surface_tendency(u_filt, v_filt, grid)
+    surf_mask = grid.mask_c[:, :, 0]
+    eta_new   = (state.eta_prev + leapfrog_dt * deta_dt) * surf_mask
+    eta_filt  = (state.eta + alpha * (eta_new - 2.0 * state.eta + state.eta_prev)) * surf_mask
 
     # ------------------------------------------------------------------
     # 10. Diagnose w; impose kinematic BC w[0] = deta/dt
@@ -309,10 +318,11 @@ def step(
         w   = w_new,
         T   = T_new,
         S   = S_new,
-        eta = eta_new,
-        # Asselin-filtered velocities become the "previous" level
-        u_prev = u_filt,
-        v_prev = v_filt,
+        eta      = eta_new,
+        # Asselin-filtered fields become the "previous" level for next step
+        u_prev   = u_filt,
+        v_prev   = v_filt,
+        eta_prev = eta_filt,
         # Rotate tendency history for AB3
         T_tend_prev  = G_T,
         S_tend_prev  = G_S,

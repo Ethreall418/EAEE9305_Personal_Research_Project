@@ -99,6 +99,7 @@ class OceanState(eqx.Module):
 
     Time-stepping history (leapfrog / AB3):
         u_prev, v_prev         - velocity at time n-1  (Nx, Ny, Nz)
+        eta_prev               - SSH at time n-1 (Nx, Ny); leapfrog history
         T_tend_prev            - T tendency at time n-1 (Nx, Ny, Nz)
         S_tend_prev            - S tendency at time n-1 (Nx, Ny, Nz)
         T_tend_prev2           - T tendency at time n-2 (for full AB3)
@@ -117,8 +118,9 @@ class OceanState(eqx.Module):
     eta: jnp.ndarray         # (Nx, Ny)
 
     # leapfrog history
-    u_prev: jnp.ndarray      # (Nx, Ny, Nz)
-    v_prev: jnp.ndarray      # (Nx, Ny, Nz)
+    u_prev:   jnp.ndarray    # (Nx, Ny, Nz)
+    v_prev:   jnp.ndarray    # (Nx, Ny, Nz)
+    eta_prev: jnp.ndarray    # (Nx, Ny)
 
     # Adams-Bashforth history (two previous tendencies for AB3)
     T_tend_prev:  jnp.ndarray   # (Nx, Ny, Nz)
@@ -140,9 +142,10 @@ class OceanState(eqx.Module):
             w  = self.w   * grid.mask_w,
             T  = self.T   * grid.mask_c,
             S  = self.S   * grid.mask_c,
-            eta= self.eta * grid.mask_c[:, :, 0],
-            u_prev = self.u_prev * grid.mask_u,
-            v_prev = self.v_prev * grid.mask_v,
+            eta      = self.eta      * grid.mask_c[:, :, 0],
+            u_prev   = self.u_prev   * grid.mask_u,
+            v_prev   = self.v_prev   * grid.mask_v,
+            eta_prev = self.eta_prev * grid.mask_c[:, :, 0],
             T_tend_prev  = self.T_tend_prev  * grid.mask_c,
             S_tend_prev  = self.S_tend_prev  * grid.mask_c,
             T_tend_prev2 = self.T_tend_prev2 * grid.mask_c,
@@ -165,9 +168,10 @@ def create_zero_state(grid: OceanGrid) -> OceanState:
         w  = z((Nx, Ny, Nz+1),  dtype=jnp.float32),
         T  = z((Nx, Ny, Nz),    dtype=jnp.float32),
         S  = z((Nx, Ny, Nz),    dtype=jnp.float32),
-        eta= z((Nx, Ny),        dtype=jnp.float32),
-        u_prev = z((Nx, Ny, Nz), dtype=jnp.float32),
-        v_prev = z((Nx, Ny, Nz), dtype=jnp.float32),
+        eta      = z((Nx, Ny),        dtype=jnp.float32),
+        u_prev   = z((Nx, Ny, Nz), dtype=jnp.float32),
+        v_prev   = z((Nx, Ny, Nz), dtype=jnp.float32),
+        eta_prev = z((Nx, Ny),     dtype=jnp.float32),
         T_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         S_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         T_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
@@ -210,8 +214,9 @@ def create_from_arrays(
 
     state = OceanState(
         u=u, v=v, w=w, T=T, S=S, eta=eta,
-        u_prev=u.copy(),
-        v_prev=v.copy(),
+        u_prev   = u.copy(),
+        v_prev   = v.copy(),
+        eta_prev = eta.copy(),
         T_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         S_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         T_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
@@ -241,9 +246,10 @@ def create_rest_state(
         w  = z((Nx, Ny, Nz+1), dtype=jnp.float32),
         T  = T,
         S  = S,
-        eta= z((Nx, Ny),       dtype=jnp.float32),
-        u_prev = z((Nx, Ny, Nz), dtype=jnp.float32),
-        v_prev = z((Nx, Ny, Nz), dtype=jnp.float32),
+        eta      = z((Nx, Ny),       dtype=jnp.float32),
+        u_prev   = z((Nx, Ny, Nz), dtype=jnp.float32),
+        v_prev   = z((Nx, Ny, Nz), dtype=jnp.float32),
+        eta_prev = z((Nx, Ny),     dtype=jnp.float32),
         T_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         S_tend_prev  = z((Nx, Ny, Nz), dtype=jnp.float32),
         T_tend_prev2 = z((Nx, Ny, Nz), dtype=jnp.float32),
