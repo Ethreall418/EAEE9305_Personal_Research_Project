@@ -279,21 +279,36 @@ def _create_nc(path: str, grid) -> nc_lib.Dataset:
     ds.createDimension("x",      grid.Nx)
     ds.createDimension("y",      grid.Ny)
     ds.createDimension("z",      grid.Nz)
+    ds.createDimension("zw",     grid.Nz + 1)
 
     v = ds.createVariable("time", "f4", ("time",));  v.units = "s"
     v = ds.createVariable("x",    "f4", ("x",));     v.units = "degrees_east";  v[:] = np.array(grid.lon_c)
     v = ds.createVariable("y",    "f4", ("y",));     v.units = "degrees_north"; v[:] = np.array(grid.lat_c)
     v = ds.createVariable("z",    "f4", ("z",));     v.units = "m";             v[:] = np.array(grid.z_c)
+    v = ds.createVariable("zw",   "f4", ("zw",));    v.units = "m";             v[:] = np.array(grid.z_w)
 
     if N_ENSEMBLE > 1:
         ds.createDimension("member", N_ENSEMBLE)
-        ds.createVariable("T",   "f4", ("time", "member", "x", "y", "z"), fill_value=np.float32(np.nan))
-        ds.createVariable("S",   "f4", ("time", "member", "x", "y", "z"), fill_value=np.float32(np.nan))
-        ds.createVariable("eta", "f4", ("time", "member", "x", "y"),       fill_value=np.float32(np.nan))
+        ds.createVariable("T",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("S",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("eta", "f4", ("time", "member", "x", "y"),        fill_value=np.float32(np.nan))
+        ds.createVariable("u",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("v",   "f4", ("time", "member", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("w",   "f4", ("time", "member", "x", "y", "zw"), fill_value=np.float32(np.nan))
     else:
-        ds.createVariable("T",   "f4", ("time", "x", "y", "z"), fill_value=np.float32(np.nan))
-        ds.createVariable("S",   "f4", ("time", "x", "y", "z"), fill_value=np.float32(np.nan))
-        ds.createVariable("eta", "f4", ("time", "x", "y"),       fill_value=np.float32(np.nan))
+        ds.createVariable("T",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("S",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("eta", "f4", ("time", "x", "y"),        fill_value=np.float32(np.nan))
+        ds.createVariable("u",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("v",   "f4", ("time", "x", "y", "z"),  fill_value=np.float32(np.nan))
+        ds.createVariable("w",   "f4", ("time", "x", "y", "zw"), fill_value=np.float32(np.nan))
+    # attach units
+    ds.variables["T"].units   = "degC"
+    ds.variables["S"].units   = "psu"
+    ds.variables["eta"].units = "m"
+    ds.variables["u"].units   = "m s-1"
+    ds.variables["v"].units   = "m s-1"
+    ds.variables["w"].units   = "m s-1"
     return ds
 
 
@@ -308,10 +323,16 @@ def _write_snapshot(ds: nc_lib.Dataset, state) -> None:
         ds.variables["T"][i,   :, :, :, :] = np.array(state.T)
         ds.variables["S"][i,   :, :, :, :] = np.array(state.S)
         ds.variables["eta"][i, :, :, :]    = np.array(state.eta)
+        ds.variables["u"][i,   :, :, :, :] = np.array(state.u)
+        ds.variables["v"][i,   :, :, :, :] = np.array(state.v)
+        ds.variables["w"][i,   :, :, :, :] = np.array(state.w)
     else:
         ds.variables["T"][i,   :, :, :] = np.array(state.T)
         ds.variables["S"][i,   :, :, :] = np.array(state.S)
         ds.variables["eta"][i, :, :]    = np.array(state.eta)
+        ds.variables["u"][i,   :, :, :] = np.array(state.u)
+        ds.variables["v"][i,   :, :, :] = np.array(state.v)
+        ds.variables["w"][i,   :, :, :] = np.array(state.w)
     ds.sync()
 
 
