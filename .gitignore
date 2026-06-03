@@ -1,0 +1,21 @@
+# IDE / editor configs
+.idea/
+.vscode/
+
+# Claude Code local config
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# JAX / experiment outputs
+*.nc
+output/
+outputs/
+*.log

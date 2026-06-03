@@ -78,6 +78,8 @@ def upwind_advection(
     v:    jnp.ndarray,
     w:    jnp.ndarray,
     grid: OceanGrid,
+    phi_ref=None,
+    obc=None,
 ) -> jnp.ndarray:
     """
     1st-order upwind flux-form advective tendency for tracer phi.
@@ -92,23 +94,50 @@ def upwind_advection(
     so that no advective flux crosses the sea surface; surface tracer
     exchange is handled by the explicit forcing tendencies.
 
+    Open boundary conditions (when ``obc`` is supplied)
+    ---------------------------------------------------
+    West face (i=0): hard wall – zero advective flux.
+    East face (i=Nx-1):
+        Inflow (u[-1, :, :] < 0): the ghost-cell tracer value is
+            ``phi_ref[-1, :, :]`` (instead of the periodic wrap
+            ``phi[0, :, :]``); the corresponding u-component is also
+            replaced with ``obc.u_ref`` so the advective and diagnostic
+            mass fluxes stay consistent.
+        Outflow: untouched – upwind from the interior.
+
     Args:
-        phi : (Nx, Ny, Nz)    tracer at cell centres
-        u   : (Nx, Ny, Nz)    zonal velocity at east faces
-        v   : (Nx, Ny, Nz)    meridional velocity at north faces
-        w   : (Nx, Ny, Nz+1)  vertical velocity (positive downward)
-        grid: OceanGrid
+        phi     : (Nx, Ny, Nz)    tracer at cell centres
+        u       : (Nx, Ny, Nz)    zonal velocity at east faces
+        v       : (Nx, Ny, Nz)    meridional velocity at north faces
+        w       : (Nx, Ny, Nz+1)  vertical velocity (positive downward)
+        grid    : OceanGrid
+        phi_ref : optional reference tracer (Nx, Ny, Nz) used for the
+                  east-boundary inflow ghost value when ``obc`` is supplied.
+        obc     : optional OpenBCs.  ``None`` keeps the periodic-x behaviour.
 
     Returns:
         dC/dt|_adv : (Nx, Ny, Nz), zeroed at dry cells
     """
     dz = grid.dz_c   # (Nz,)
 
+    # East-boundary u override on inflow (consistent with dynamics.compute_w)
+    if obc is not None:
+        inflow_e = (u[-1, :, :] < 0.0).astype(u.dtype)
+        u_east   = (inflow_e * obc.u_ref[-1, :, :]
+                    + (1.0 - inflow_e) * u[-1, :, :]) * grid.mask_u[-1, :, :]
+        u = u.at[-1, :, :].set(u_east)
+
     # ---- Zonal flux (east face, i+1/2) -------------------------------------
     phi_e = jnp.roll(phi, -1, axis=0)
+    if obc is not None and phi_ref is not None:
+        # East-boundary ghost cell uses reference tracer (replaces phi[0] wrap)
+        phi_e = phi_e.at[-1, :, :].set(phi_ref[-1, :, :])
     C_e   = jnp.where(u >= 0, phi, phi_e)
     Fu_e  = u * grid.mask_u * C_e * (grid.dy_c[:, :, jnp.newaxis] * dz)
     Fu_w  = jnp.roll(Fu_e, 1, axis=0)
+    if obc is not None:
+        # West-boundary wall: zero advective flux
+        Fu_w = Fu_w.at[0, :, :].set(0.0)
 
     # ---- Meridional flux (north face, j+1/2) --------------------------------
     phi_n = jnp.roll(phi, -1, axis=1)
@@ -140,6 +169,8 @@ def centered_advection(
     v:    jnp.ndarray,
     w:    jnp.ndarray,
     grid: OceanGrid,
+    phi_ref=None,
+    obc=None,
 ) -> jnp.ndarray:
     """
     2nd-order centered flux-form advective tendency for tracer phi.
@@ -150,14 +181,28 @@ def centered_advection(
     diffusion.  For production runs requiring low numerical diffusion, a
     limiter-based scheme (e.g. TVD or PPM) is the appropriate next step.
 
+    Open boundary conditions: same convention as ``upwind_advection`` –
+    west face wall, east-face ghost cell uses ``phi_ref`` when supplied.
+
     Args / Returns: same convention as ``upwind_advection``.
     """
     dz = grid.dz_c
 
+    # East-boundary u override on inflow
+    if obc is not None:
+        inflow_e = (u[-1, :, :] < 0.0).astype(u.dtype)
+        u_east   = (inflow_e * obc.u_ref[-1, :, :]
+                    + (1.0 - inflow_e) * u[-1, :, :]) * grid.mask_u[-1, :, :]
+        u = u.at[-1, :, :].set(u_east)
+
     # ---- Zonal ----
     phi_e = jnp.roll(phi, -1, axis=0)
+    if obc is not None and phi_ref is not None:
+        phi_e = phi_e.at[-1, :, :].set(phi_ref[-1, :, :])
     Fu_e  = u * grid.mask_u * 0.5 * (phi + phi_e) * (grid.dy_c[:, :, jnp.newaxis] * dz)
     Fu_w  = jnp.roll(Fu_e, 1, axis=0)
+    if obc is not None:
+        Fu_w = Fu_w.at[0, :, :].set(0.0)
 
     # ---- Meridional ----
     phi_n = jnp.roll(phi, -1, axis=1)
@@ -184,6 +229,7 @@ def kappa_laplacian_h(
     phi:     jnp.ndarray,
     kappa_h: jnp.ndarray,
     grid:    OceanGrid,
+    obc=None,
 ) -> jnp.ndarray:
     """
     Flux-form horizontal Laplacian with scalar or spatially varying kappa_h.
@@ -197,10 +243,17 @@ def kappa_laplacian_h(
     face centres before forming fluxes.  Negative values are clamped to
     zero to prevent anti-diffusion.
 
+    Open boundary conditions (when ``obc`` is supplied)
+    ---------------------------------------------------
+    West face (i=0): zero diffusive flux (wall).
+    East face (i=Nx-1): Neumann (zero gradient) – ``phi_e[-1, :, :]`` is
+        set to ``phi[-1, :, :]`` so the east-face gradient vanishes.
+
     Args:
         phi     : (Nx, Ny, Nz)
         kappa_h : scalar  or  (Nx, Ny, Nz) [m² s-1]
         grid    : OceanGrid
+        obc     : optional OpenBCs.  ``None`` keeps the periodic-x behaviour.
 
     Returns:
         (Nx, Ny, Nz), zeroed at dry cells
@@ -221,8 +274,14 @@ def kappa_laplacian_h(
 
     # East-face diffusive flux
     phi_e = jnp.roll(phi, -1, axis=0)
+    if obc is not None:
+        # East Neumann: zero gradient at i=Nx-1 east face
+        phi_e = phi_e.at[-1, :, :].set(phi[-1, :, :])
     Fx_e  = kappa_u * dy_c * (phi_e - phi) / dx_u * grid.mask_u
     Fx_w  = jnp.roll(Fx_e, 1, axis=0)
+    if obc is not None:
+        # West wall: zero diffusive flux
+        Fx_w = Fx_w.at[0, :, :].set(0.0)
 
     # North-face diffusive flux (north Neumann BC; dx_v metric)
     phi_n = jnp.roll(phi, -1, axis=1)
@@ -247,6 +306,8 @@ def tracer_tendency(
     w:       jnp.ndarray,
     kappa_h: jnp.ndarray,
     grid:    OceanGrid,
+    phi_ref=None,
+    obc=None,
 ) -> jnp.ndarray:
     """
     Explicit tracer tendency: 1st-order upwind advection + horizontal diffusion.
@@ -262,12 +323,14 @@ def tracer_tendency(
         w       : (Nx, Ny, Nz+1)  vertical velocity
         kappa_h : scalar or (Nx, Ny, Nz) [m² s-1]
         grid    : OceanGrid
+        phi_ref : optional reference tracer for east-boundary inflow.
+        obc     : optional OpenBCs.  ``None`` keeps periodic-x behaviour.
 
     Returns:
         dC/dt|_explicit : (Nx, Ny, Nz)
     """
-    adv    = upwind_advection(phi, u, v, w, grid)
-    diff_h = kappa_laplacian_h(phi, kappa_h, grid)
+    adv    = upwind_advection(phi, u, v, w, grid, phi_ref=phi_ref, obc=obc)
+    diff_h = kappa_laplacian_h(phi, kappa_h, grid, obc=obc)
     return (adv + diff_h) * grid.mask_c
 
 

@@ -397,6 +397,7 @@ def free_surface_tendency(
     u:    jnp.ndarray,
     v:    jnp.ndarray,
     grid: OceanGrid,
+    obc=None,
 ) -> jnp.ndarray:
     """
     Sea-surface height tendency from the depth-integrated continuity equation.
@@ -411,21 +412,41 @@ def free_surface_tendency(
     width dy_c, north-face width dx_v (cos(lat_v) metric), zero south flux
     at j=0, output gated by the surface mask_c[:,:,0].
 
+    Open boundary conditions (when ``obc`` is supplied)
+    ---------------------------------------------------
+    West face (i=0): periodic wrap is replaced with the reference
+        depth-integrated transport ``obc.U_col_ref[0, :] * dy_c[0, :]``.
+    East face (i=Nx-1): inflow (``u[-1, :, :] < 0``) is replaced with the
+        reference velocity ``obc.u_ref[-1, :, :]`` before the depth integral;
+        outflow is left untouched.
+
     Args:
         u    : (Nx, Ny, Nz) zonal velocity at u-points [m s-1]
         v    : (Nx, Ny, Nz) meridional velocity at v-points [m s-1]
         grid : OceanGrid
+        obc  : Optional OpenBCs.  ``None`` keeps the periodic-x behaviour.
 
     Returns:
         deta/dt : (Nx, Ny) [m s-1], zeroed at dry surface cells
     """
+    # East-boundary inflow override (must happen before the depth integral)
+    if obc is not None:
+        inflow_e = (u[-1, :, :] < 0.0).astype(u.dtype)
+        u_east   = (inflow_e * obc.u_ref[-1, :, :]
+                    + (1.0 - inflow_e) * u[-1, :, :]) * grid.mask_u[-1, :, :]
+        u = u.at[-1, :, :].set(u_east)
+
     # Depth-integrated transports (mask already embedded in u, v)
     U_col = jnp.sum(u * grid.mask_u * grid.dz_c, axis=-1)   # (Nx, Ny)
     V_col = jnp.sum(v * grid.mask_v * grid.dz_c, axis=-1)   # (Nx, Ny)
 
     # 2-D flux-form divergence
     Fu   = U_col * grid.dy_c                                  # east-face flux
-    dFu  = Fu - jnp.roll(Fu, 1, axis=0)
+    Fu_w = jnp.roll(Fu, 1, axis=0)
+    if obc is not None:
+        # Replace the periodic-wrap west face at i=0 with the reference transport
+        Fu_w = Fu_w.at[0, :].set(obc.U_col_ref[0, :] * grid.dy_c[0, :])
+    dFu  = Fu - Fu_w
 
     Fv   = V_col * grid.dx_v                                  # north-face flux
     Fv_s = jnp.concatenate(
@@ -444,6 +465,7 @@ def compute_w(
     u:    jnp.ndarray,
     v:    jnp.ndarray,
     grid: OceanGrid,
+    obc=None,
 ) -> jnp.ndarray:
     """
     Diagnose vertical velocity w from the incompressibility constraint.
@@ -462,17 +484,38 @@ def compute_w(
     area metrics as div_h in operators.py, ensuring consistency with
     the tracer advection discretisation.
 
+    Open boundary conditions (when ``obc`` is supplied)
+    ---------------------------------------------------
+    West face (i=0): periodic wrap is replaced per-layer with
+        ``obc.u_ref[0, :, :] * dy_c[0, :, None]``.
+    East face (i=Nx-1): inflow (``u[-1, :, :] < 0``) replaced with the
+        reference velocity ``obc.u_ref[-1, :, :]``; outflow untouched.
+
     Args:
         u    : (Nx, Ny, Nz)  zonal velocity at u-points [m s-1]
         v    : (Nx, Ny, Nz)  meridional velocity at v-points [m s-1]
         grid : OceanGrid
+        obc  : Optional OpenBCs.  ``None`` keeps the periodic-x behaviour.
 
     Returns:
         w : (Nx, Ny, Nz+1) [m s-1], gated by mask_w
     """
+    # East-boundary inflow override
+    if obc is not None:
+        inflow_e = (u[-1, :, :] < 0.0).astype(u.dtype)
+        u_east   = (inflow_e * obc.u_ref[-1, :, :]
+                    + (1.0 - inflow_e) * u[-1, :, :]) * grid.mask_u[-1, :, :]
+        u = u.at[-1, :, :].set(u_east)
+
     # Horizontal divergence at cell centres: (Nx, Ny, Nz)
     Fu    = u * grid.mask_u * grid.dy_c[:, :, jnp.newaxis]
-    dFu   = Fu - jnp.roll(Fu, 1, axis=0)
+    Fu_w  = jnp.roll(Fu, 1, axis=0)
+    if obc is not None:
+        # Replace west boundary with reference per-layer flux
+        Fu_w_ref = (obc.u_ref[0, :, :] * grid.mask_u[0, :, :]
+                    * grid.dy_c[0, :, jnp.newaxis])
+        Fu_w = Fu_w.at[0, :, :].set(Fu_w_ref)
+    dFu   = Fu - Fu_w
 
     Fv    = v * grid.mask_v * grid.dx_v[:, :, jnp.newaxis]
     Fv_s  = jnp.concatenate(

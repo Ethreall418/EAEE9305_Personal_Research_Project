@@ -91,6 +91,7 @@ from OceanJAX.Physics.mixing import (
     implicit_vertical_visc,
     implicit_vertical_mix,
 )
+from OceanJAX.Physics.obc import OpenBCs, apply_obc
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +190,7 @@ def step(
     params:  ModelParams,
     forcing: Optional[SurfaceForcing] = None,
     closure: Optional[AbstractClosure] = None,
+    obc:     Optional[OpenBCs] = None,
 ) -> OceanState:
     """
     Advance the model state by one time step dt.
@@ -210,6 +212,7 @@ def step(
     9.  Free-surface update: eta_new = eta + dt * deta_dt
     10. Diagnose w from continuity; set w[0] = deta_dt (kinematic BC).
     11. Apply all masks and assemble new OceanState.
+        + Open-boundary relaxation/inflow override via apply_obc (if obc).
 
     Args:
         state   : OceanState at time n
@@ -222,6 +225,15 @@ def step(
                   scale the vertical diffusivity (kappa_v_scale).
                   Passing None (default) skips the hook entirely; the
                   numerical path is bit-identical to the pure-physics version.
+        obc     : OpenBCs instance, or None.
+                  When supplied, the zonally-periodic boundary conditions
+                  in free_surface_tendency, compute_w, and tracer_tendency
+                  are replaced with open-boundary handling (west wall for
+                  tracers, west reference transport for dynamics, east
+                  outflow-free / inflow-from-reference).  An eta relaxation
+                  toward ``obc.eta_ref`` at the i=0 and i=Nx-1 columns is
+                  applied at the end of the step.
+                  Passing None (default) preserves the periodic-x behaviour.
 
     Returns:
         OceanState at time n+1
@@ -275,8 +287,12 @@ def step(
     #    tracer and momentum fields see a consistent velocity state.
     # ------------------------------------------------------------------
     # Use current w (not yet updated) for tracer advection
-    G_T = tracer_tendency(state.T, u_filt, v_filt, state.w, params.kappa_h, grid)
-    G_S = tracer_tendency(state.S, u_filt, v_filt, state.w, params.kappa_h, grid)
+    T_ref = obc.T_ref if obc is not None else None
+    S_ref = obc.S_ref if obc is not None else None
+    G_T = tracer_tendency(state.T, u_filt, v_filt, state.w, params.kappa_h, grid,
+                          phi_ref=T_ref, obc=obc)
+    G_S = tracer_tendency(state.S, u_filt, v_filt, state.w, params.kappa_h, grid,
+                          phi_ref=S_ref, obc=obc)
 
     if forcing is not None:
         G_T = G_T + heat_surface_tendency(forcing.heat_flux, grid, params)
@@ -331,7 +347,7 @@ def step(
     #    Subsequent steps: eta_new = eta_prev + 2*dt * deta_dt.
     #    Asselin-Robert filter applied to current eta (same alpha as u/v).
     # ------------------------------------------------------------------
-    deta_dt   = free_surface_tendency(u_filt, v_filt, grid)
+    deta_dt   = free_surface_tendency(u_filt, v_filt, grid, obc=obc)
     surf_mask = grid.mask_c[:, :, 0]
     eta_new   = (state.eta_prev + leapfrog_dt * deta_dt) * surf_mask
     eta_filt  = (state.eta + alpha * (eta_new - 2.0 * state.eta + state.eta_prev)) * surf_mask
@@ -342,14 +358,14 @@ def step(
     #    that the surface BC and the interior continuity diagnosis are
     #    consistent within the step.
     # ------------------------------------------------------------------
-    w_new = compute_w(u_filt, v_filt, grid)
+    w_new = compute_w(u_filt, v_filt, grid, obc=obc)
     # Set the surface face to the kinematic signal; mask_w gates it.
     w_new = w_new.at[:, :, 0].set(deta_dt * grid.mask_w[:, :, 0])
 
     # ------------------------------------------------------------------
-    # 11. Assemble new state
+    # 11. Assemble new state (+ apply open-boundary relaxation if obc).
     # ------------------------------------------------------------------
-    return OceanState(
+    new_state = OceanState(
         u   = u_new,
         v   = v_new,
         w   = w_new,
@@ -368,6 +384,9 @@ def step(
         time       = state.time + dt,
         step_count = state.step_count + 1,
     )
+    if obc is not None:
+        new_state = apply_obc(new_state, grid, obc)
+    return new_state
 
 
 # ---------------------------------------------------------------------------
@@ -382,6 +401,7 @@ def run(
     forcing_sequence: Optional[SurfaceForcing] = None,
     save_history:     bool = False,
     closure:          Optional[AbstractClosure] = None,
+    obc:              Optional[OpenBCs] = None,
 ) -> tuple[OceanState, Optional[OceanState]]:
     """
     Integrate the model for ``n_steps`` time steps using ``jax.lax.scan``.
@@ -406,6 +426,9 @@ def run(
         closure          : AbstractClosure instance, or None.
                            Passed through to every call to ``step()``.
                            See ``step()`` for details.
+        obc              : OpenBCs instance, or None.  Passed through to
+                           every call to ``step()``.  See ``step()`` for
+                           the boundary semantics.
 
     Returns:
         (final_state, history)
@@ -414,7 +437,7 @@ def run(
                       if save_history=True, else None.
     """
     def _step_fn(carry: OceanState, forcing_t: Optional[SurfaceForcing]):
-        new_state = step(carry, grid, params, forcing_t, closure)
+        new_state = step(carry, grid, params, forcing_t, closure, obc)
         output    = new_state if save_history else None
         return new_state, output
 

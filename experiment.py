@@ -95,6 +95,28 @@ TAU_Y     = 0.0
 N_ENSEMBLE        = 1      # number of ensemble members (1 = single run)
 ENSEMBLE_PERTURB_T = 0.0   # Gaussian T perturbation std [°C] for each member
 
+# --- Open boundary conditions -------------------------------------------------
+#
+# OBC_ENABLED   When True, replace the default zonally-periodic boundary with
+#               open-east / open-west handling driven by ORAS5 reference fields:
+#                 west face (i=0)   – periodic wrap replaced with the depth-
+#                                     integrated reference transport from
+#                                     ORAS5; tracer flux is set to zero (wall).
+#                 east face (i=Nx-1)– outflow free; on inflow (u<0) the
+#                                     velocity and tracer values are taken
+#                                     from ORAS5.
+#                 eta               – relaxed toward ORAS5 eta at i=0 and
+#                                     i=Nx-1 with fraction ETA_RELAX_ALPHA
+#                                     per step.
+#               Requires INIT_MODE != "rest" (uses the same ORAS5 file as the
+#               initial state).
+#               Currently incompatible with N_ENSEMBLE > 1.
+# ETA_RELAX_ALPHA Relaxation fraction per step for the boundary eta columns.
+#                  0.0  = no nudging   1.0 = hard reset to ORAS5 each step.
+
+OBC_ENABLED     = False
+ETA_RELAX_ALPHA = 0.5
+
 # --- Output -------------------------------------------------------------------
 OUTPUT_NC     = "output_cold_full_forcing.nc"
 SAVE_INTERVAL = 288   # steps between NetCDF snapshots  (288 × 300 s = 1 day)
@@ -126,14 +148,17 @@ def _build_grid():
     )
 
 
-def _build_state(grid):
+def _read_oras5_full_state(grid):
+    """
+    Read and regrid the ORAS5 reference state.  Returns ``None`` for the
+    "rest" init mode (no ORAS5 needed).  Shared between the initial-state
+    builder and the OBC builder so the (expensive) regrid runs only once.
+    """
     import warnings
-    from OceanJAX.state import create_rest_state, create_from_arrays
     from OceanJAX.data.oras5 import read_oras5, regrid_to_model
 
-    if INIT_MODE == "rest":
-        print(f"Init: rest  T={T_BG} °C  S={S_BG} psu")
-        return create_rest_state(grid, T_background=T_BG, S_background=S_BG)
+    if INIT_MODE == "rest" and not OBC_ENABLED:
+        return None
 
     if not _ORAS5_FILE.exists():
         print(f"ERROR: ORAS5 file not found: {_ORAS5_FILE}", file=sys.stderr)
@@ -147,6 +172,15 @@ def _build_state(grid):
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
         full_state = regrid_to_model(raw, grid)
+    return full_state
+
+
+def _build_state(grid, full_state):
+    from OceanJAX.state import create_rest_state, create_from_arrays
+
+    if INIT_MODE == "rest":
+        print(f"Init: rest  T={T_BG} °C  S={S_BG} psu")
+        return create_rest_state(grid, T_background=T_BG, S_background=S_BG)
 
     if INIT_MODE == "oras5_full":
         state = full_state
@@ -168,6 +202,38 @@ def _build_state(grid):
     print(f"  T_wet=[{T_a[wet].min():.2f}, {T_a[wet].max():.2f}] °C  "
           f"S_wet=[{S_a[wet].min():.2f}, {S_a[wet].max():.2f}] psu")
     return state
+
+
+def _build_obc(grid, full_state):
+    """
+    Build an ``OpenBCs`` instance from the regridded ORAS5 reference state.
+
+    Returns ``None`` if ``OBC_ENABLED`` is False.  Raises if OBC is requested
+    without an ORAS5 reference state (INIT_MODE == "rest").
+    """
+    if not OBC_ENABLED:
+        return None
+    if full_state is None:
+        raise ValueError(
+            "OBC_ENABLED=True requires an ORAS5 reference state; set "
+            "INIT_MODE to 'oras5_cold' or 'oras5_full'."
+        )
+    from OceanJAX.Physics.obc import OpenBCs
+
+    u_ref      = full_state.u
+    U_col_ref  = jnp.sum(u_ref * grid.mask_u * grid.dz_c, axis=-1)   # (Nx, Ny)
+    obc = OpenBCs(
+        u_ref     = u_ref,
+        T_ref     = full_state.T,
+        S_ref     = full_state.S,
+        eta_ref   = full_state.eta,
+        U_col_ref = U_col_ref,
+        alpha_eta = float(ETA_RELAX_ALPHA),
+    )
+    print(f"OBC: enabled  alpha_eta={ETA_RELAX_ALPHA}  "
+          f"U_col_ref[west] range=[{float(U_col_ref[0,:].min()):.2f}, "
+          f"{float(U_col_ref[0,:].max()):.2f}] m^2/s")
+    return obc
 
 
 def _build_ensemble_states(base_state, grid):
@@ -274,6 +340,8 @@ def _create_nc(path: str, grid) -> nc_lib.Dataset:
     ds.tau_x       = TAU_X
     ds.tau_y       = TAU_Y
     ds.n_ensemble  = N_ENSEMBLE
+    ds.obc_enabled     = int(OBC_ENABLED)
+    ds.eta_relax_alpha = float(ETA_RELAX_ALPHA)
 
     ds.createDimension("time",   None)
     ds.createDimension("x",      grid.Nx)
@@ -398,16 +466,27 @@ def main() -> None:
     print(f"  output    : {OUTPUT_NC}  save_every={SAVE_INTERVAL} steps")
     print("=" * 62)
 
+    if OBC_ENABLED and ensemble:
+        print("ERROR: OBC_ENABLED is not yet compatible with N_ENSEMBLE > 1.",
+              file=sys.stderr)
+        sys.exit(1)
+
     grid   = _build_grid()
     params = ModelParams(dt=DT)
 
+    # Build ORAS5 reference state once (shared between init and OBC).
+    full_state = _read_oras5_full_state(grid)
+
     # Build initial state(s)
-    base_state = _build_state(grid)
+    base_state = _build_state(grid, full_state)
     if ensemble:
         state = _build_ensemble_states(base_state, grid)
         print(f"  Ensemble of {N_ENSEMBLE} members created.")
     else:
         state = base_state
+
+    # Build OBC (None if disabled)
+    obc = _build_obc(grid, full_state)
 
     # Compile run function
     if ensemble:
@@ -422,7 +501,8 @@ def main() -> None:
         run_jit = jax.jit(ocean_run, static_argnames=("n_steps", "save_history"))
         def _run_chunk(s, chunk, forcing):
             return run_jit(s, grid, params, n_steps=chunk,
-                           forcing_sequence=forcing, save_history=False)
+                           forcing_sequence=forcing, save_history=False,
+                           obc=obc)
 
     # Open output file and save t=0
     ds = _create_nc(OUTPUT_NC, grid)
